@@ -7,6 +7,9 @@ import threading
 import queue
 import subprocess
 import re
+import json
+import urllib.request
+import urllib.parse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,7 +21,6 @@ from telegram.ext import (
     CallbackContext,
 )
 import yt_dlp
-import requests
 
 # ========== KONFIGURASI ==========
 TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -36,6 +38,9 @@ download_queue = queue.Queue()
 
 # Batas ukuran file (200MB = 200 * 1024 * 1024)
 MAX_FILE_SIZE = 200 * 1024 * 1024
+
+# API Key untuk Spotify Downloader
+SPOTIFY_API_KEY = "54e3852bd3msh27c27c29c524075p1198c0jsn1090b1059bcc"
 
 # Logging
 logging.basicConfig(
@@ -62,55 +67,103 @@ def detect_platform(url: str) -> str:
     else:
         return 'unknown'
 
-def get_spotify_track_info(url: str) -> Optional[tuple]:
-    """Ambil info track dari Spotify menggunakan API gratis"""
+# ========== FUNGSI DOWNLOAD SPOTIFY VIA API ==========
+def download_spotify_api(url: str) -> Optional[Path]:
+    """Download lagu dari Spotify menggunakan API RapidAPI"""
     try:
-        # Extract track ID dari URL Spotify
+        # Extract track ID dari URL
         track_id_match = re.search(r'track/([a-zA-Z0-9]+)', url)
         if not track_id_match:
+            logger.error("Cannot extract track ID from Spotify URL")
             return None
         
         track_id = track_id_match.group(1)
         
-        # Gunakan API Spotify gratis (Spotify API wrapper)
-        api_url = f"https://spotify-api.cfapps.eu10.hana.ondemand.com/api/tracks/{track_id}"
+        # URL encoded untuk API
+        encoded_url = urllib.parse.quote(url, safe='')
+        
+        # Call API untuk mendapatkan link download
+        api_url = f"https://spotify-downloader-api.p.rapidapi.com/Home/Download?Tracklink={encoded_url}"
+        
+        headers = {
+            'x-rapidapi-key': SPOTIFY_API_KEY,
+            'x-rapidapi-host': 'spotify-downloader-api.p.rapidapi.com',
+            'Content-Type': 'application/json'
+        }
+        
+        logger.info(f"Calling Spotify API for: {url}")
+        
+        # Buat request
+        req = urllib.request.Request(api_url, headers=headers, method='GET')
         
         try:
-            response = requests.get(api_url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                track_name = data.get('name', '')
-                artists = data.get('artists', [])
-                artist_name = artists[0].get('name', '') if artists else ''
-                return (track_name, artist_name)
-        except:
-            pass
-        
-        # Fallback: extract dari string URL
-        # Format: https://open.spotify.com/track/xxxx?si=yyyy
-        return (track_id, "Unknown Artist")
-        
+            with urllib.request.urlopen(req, timeout=30) as response:
+                response_data = response.read().decode('utf-8')
+                data = json.loads(response_data)
+                
+                logger.info(f"API Response: {data}")
+                
+                # Cek response untuk link download
+                download_url = None
+                
+                # Format response yang mungkin
+                if isinstance(data, dict):
+                    if 'downloadLink' in data:
+                        download_url = data['downloadLink']
+                    elif 'link' in data:
+                        download_url = data['link']
+                    elif 'url' in data:
+                        download_url = data['url']
+                    elif 'data' in data and isinstance(data['data'], dict):
+                        if 'downloadLink' in data['data']:
+                            download_url = data['data']['downloadLink']
+                
+                if not download_url:
+                    logger.error("No download link in API response")
+                    return None
+                
+                # Download file dari URL yang diberikan
+                output_file = DOWNLOAD_DIR / f"spotify_{track_id}.mp3"
+                
+                logger.info(f"Downloading from: {download_url}")
+                
+                # Download file
+                urllib.request.urlretrieve(download_url, output_file)
+                
+                # Cek hasil download
+                if output_file.exists() and output_file.stat().st_size > 0:
+                    logger.info(f"Spotify download success: {output_file}")
+                    return output_file
+                else:
+                    logger.error("Downloaded file is empty")
+                    return None
+                    
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP Error: {e.code} - {e.reason}")
+            if e.code == 429:
+                logger.error("Rate limit exceeded for Spotify API")
+            return None
+        except urllib.error.URLError as e:
+            logger.error(f"URL Error: {e}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Get Spotify info error: {e}")
+        logger.error(f"Spotify API download error: {e}")
         return None
 
-# ========== FUNGSI DOWNLOAD SPOTIFY (via YouTube) ==========
-def download_spotify_sync(url: str) -> Optional[Path]:
-    """Download lagu dari Spotify dengan mencari di YouTube"""
+def download_spotify_fallback(url: str) -> Optional[Path]:
+    """Fallback: Download Spotify via YouTube search jika API gagal"""
     try:
-        # Ambil info track dari Spotify
-        track_info = get_spotify_track_info(url)
-        
-        if track_info:
-            track_name, artist_name = track_info
-            search_query = f"{track_name} {artist_name} audio"
+        # Extract track info from URL for search
+        track_id_match = re.search(r'track/([a-zA-Z0-9]+)', url)
+        if track_id_match:
+            track_id = track_id_match.group(1)
+            search_query = f"spotify track {track_id}"
         else:
-            # Fallback: gunakan URL sebagai search
             search_query = url
         
-        logger.info(f"Searching YouTube for: {search_query}")
+        logger.info(f"Fallback: Searching YouTube for {search_query}")
         
-        # Opsi untuk yt-dlp - download audio dari YouTube
         output_template = str(DOWNLOAD_DIR / f"%(title)s_%(id)s.%(ext)s")
         
         ydl_opts = {
@@ -119,7 +172,7 @@ def download_spotify_sync(url: str) -> Optional[Path]:
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
-            'default_search': 'ytsearch',  # Search di YouTube
+            'default_search': 'ytsearch',
             'noplaylist': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -128,56 +181,47 @@ def download_spotify_sync(url: str) -> Optional[Path]:
             }],
         }
         
-        # Jika track_info ada, cari dengan query spesifik
-        if track_info and track_info[0] != track_info[1]:
-            search_url = f"ytsearch:{track_info[0]} {track_info[1]} official audio"
-        else:
-            search_url = url
+        search_url = f"ytsearch:{search_query} audio"
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                # Coba extract info
-                info = ydl.extract_info(search_url, download=True)
+            info = ydl.extract_info(search_url, download=True)
+            if info:
+                import time
+                time.sleep(2)
                 
-                if info:
-                    # Tunggu proses post-processor selesai
-                    import time
-                    time.sleep(2)
-                    
-                    # Cari file mp3 yang dihasilkan
-                    mp3_files = list(DOWNLOAD_DIR.glob("*.mp3"))
-                    if mp3_files:
-                        # Ambil file terbaru
-                        latest_mp3 = max(mp3_files, key=lambda f: f.stat().st_mtime)
-                        if latest_mp3.stat().st_size > 0 and latest_mp3.stat().st_size < MAX_FILE_SIZE:
-                            logger.info(f"Spotify download success: {latest_mp3}")
-                            return latest_mp3
-                    
-                    # Cari file audio lain
-                    for ext in ['.m4a', '.webm', '.opus']:
-                        audio_files = list(DOWNLOAD_DIR.glob(f"*{ext}"))
-                        if audio_files:
-                            latest_audio = max(audio_files, key=lambda f: f.stat().st_mtime)
-                            if latest_audio.stat().st_size < MAX_FILE_SIZE:
-                                return latest_audio
-            except Exception as e:
-                logger.error(f"yt-dlp search error: {e}")
-                
-                # Coba lagi dengan query lebih sederhana
-                if track_info:
-                    simple_query = f"ytsearch:{track_info[0]}"
-                    info = ydl.extract_info(simple_query, download=True)
-                    if info:
-                        time.sleep(2)
-                        mp3_files = list(DOWNLOAD_DIR.glob("*.mp3"))
-                        if mp3_files:
-                            latest_mp3 = max(mp3_files, key=lambda f: f.stat().st_mtime)
-                            return latest_mp3
+                mp3_files = list(DOWNLOAD_DIR.glob("*.mp3"))
+                if mp3_files:
+                    latest_mp3 = max(mp3_files, key=lambda f: f.stat().st_mtime)
+                    if latest_mp3.stat().st_size > 0:
+                        return latest_mp3
         
         return None
     except Exception as e:
-        logger.error(f"Spotify download error: {e}")
+        logger.error(f"Spotify fallback error: {e}")
         return None
+
+# ========== FUNGSI DOWNLOAD SPOTIFY (MAIN) ==========
+def download_spotify_sync(url: str) -> Optional[Path]:
+    """Download lagu dari Spotify - coba API dulu, lalu fallback"""
+    
+    # Coba dengan API dulu
+    logger.info("Trying Spotify API download...")
+    result = download_spotify_api(url)
+    
+    if result:
+        logger.info("Spotify API download successful")
+        return result
+    
+    # Jika API gagal, coba fallback ke YouTube
+    logger.info("API failed, trying YouTube fallback...")
+    result = download_spotify_fallback(url)
+    
+    if result:
+        logger.info("Spotify fallback download successful")
+        return result
+    
+    logger.error("All Spotify download methods failed")
+    return None
 
 # ========== FUNGSI DOWNLOAD VIDEO ==========
 def download_video_sync(url: str, platform: str) -> Optional[Path]:
@@ -265,7 +309,7 @@ def download_worker():
                                 chat_id=chat_id,
                                 audio=audio,
                                 caption=f"✅ *Download Berhasil!*\n"
-                                       f"📌 Platform: SPOTIFY (via YouTube)\n"
+                                       f"📌 Platform: SPOTIFY\n"
                                        f"📦 Ukuran: {file_size_mb:.1f} MB\n"
                                        f"🤖 @{context.bot.get_me().username}",
                                 parse_mode='Markdown',
@@ -318,7 +362,7 @@ def download_worker():
                 # Gagal download
                 error_detail = ""
                 if platform == 'spotify':
-                    error_detail = "\n• Lagu tidak ditemukan di YouTube\n• Coba lagu yang lebih populer"
+                    error_detail = "\n\n• API limit mungkin habis\n• Coba lagi nanti atau lagu lain"
                 
                 try:
                     context.bot.edit_message_text(
@@ -367,7 +411,7 @@ def start(update: Update, context: CallbackContext):
         f"🐦 Twitter | 👥 Facebook | 🎵 Spotify\n\n"
         f"📤 *Kirim link*, saya download!\n"
         f"📦 *Max file:* 200MB\n\n"
-        f"🎵 *Spotify Note:* Mencari lagu di YouTube",
+        f"🎵 *Spotify:* Download langsung via API",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
@@ -382,7 +426,7 @@ def help_command(update: Update, context: CallbackContext):
         f"⚠️ *BATASAN:*\n"
         f"• File max 200MB\n"
         f"• YouTube 720p\n"
-        f"• Spotify: mencari versi audio di YouTube\n\n"
+        f"• Spotify download via API (cepat)\n\n"
         f"💡 Link harus *public*!",
         parse_mode='Markdown'
     )
@@ -391,7 +435,7 @@ def donasi_command(update: Update, context: CallbackContext):
     update.message.reply_text(
         f"❤️ *DUKUNG HIRAKO BOT* ❤️\n\n"
         f"Bot ini *GRATIS*!\n\n"
-        f"💰 *Saweria:* [saweria.co/hirako](https://saweria.co/hirakoxs)\n\n"
+        f"💰 *Saweria:* [saweria.co/hirako](https://saweria.co/hirako)\n\n"
         f"Terima kasih! 🙏",
         parse_mode='Markdown',
         disable_web_page_preview=True
@@ -420,9 +464,9 @@ def handle_url(update: Update, context: CallbackContext):
     
     # Pesan khusus Spotify
     if platform == 'spotify':
-        status_text = f"{emoji} *Mencari lagu di YouTube...*\n" \
-                      f"⏳ Mengambil audio dari {url[:40]}...\n\n" \
-                      f"_Proses bisa 20-40 detik_"
+        status_text = f"{emoji} *Mendownload dari SPOTIFY...*\n" \
+                      f"⏳ Mengambil audio via API...\n\n" \
+                      f"_Proses bisa 10-20 detik_"
     else:
         status_text = f"{emoji} *Mendownload dari {platform.upper()}...*\n" \
                       f"⏳ Mohon tunggu sebentar...\n\n" \
@@ -467,16 +511,16 @@ def button_callback(update: Update, context: CallbackContext):
             f"1. Buka lagu di Spotify\n"
             f"2. ⋮ → Share → Copy Link\n"
             f"3. Paste link di chat\n"
-            f"4. Bot akan mencari lagu di YouTube\n"
-            f"5. Convert ke MP3 dan kirim\n\n"
-            f"⏱️ Butuh 20-40 detik\n"
-            f"📦 Hasil: MP3 192kbps",
+            f"4. Bot download via API\n"
+            f"5. Langsung kirim MP3!\n\n"
+            f"⏱️ Cuma 10-20 detik\n"
+            f"📦 Hasil: MP3 High Quality",
             parse_mode='Markdown'
         )
     elif query.data == 'donasi':
         query.edit_message_text(
             f"❤️ *SUPPORT HIRAKO BOT* ❤️\n\n"
-            f"💰 Saweria: [saweria.co/hirako](https://saweria.co/hirakoxs)\n\n"
+            f"💰 Saweria: [saweria.co/hirako](https://saweria.co/hirako)\n\n"
             f"Terima kasih! 🙏",
             parse_mode='Markdown',
             disable_web_page_preview=True
@@ -530,6 +574,7 @@ def main():
     logger.info(f"Bot: @{updater.bot.get_me().username}")
     logger.info(f"Download dir: {DOWNLOAD_DIR}")
     logger.info(f"Max file size: {MAX_FILE_SIZE / (1024*1024):.0f}MB")
+    logger.info(f"Spotify API Key: {SPOTIFY_API_KEY[:10]}...")
     
     # Start polling
     updater.start_polling()
