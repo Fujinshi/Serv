@@ -1,4 +1,6 @@
-python-telegram-bot==20.7
+python-telegram-bot==13.7
 yt-dlp==2024.4.9
 aiohttp==3.9.5
-setuptools==69.5.1
+spotdl==4.2.5
+beautifulsoup4==4.12.3
+requests==2.31.0
