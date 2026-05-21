@@ -2,9 +2,9 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
-import re
-import subprocess
+from typing import Optional, Dict
+import threading
+import queue
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,8 +16,6 @@ from telegram.ext import (
     CallbackContext,
 )
 import yt_dlp
-import requests
-from bs4 import BeautifulSoup
 
 # ========== KONFIGURASI ==========
 TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -29,6 +27,9 @@ if not TOKEN:
 # Path download
 DOWNLOAD_DIR = Path("/tmp/hirako_downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Queue untuk komunikasi antar thread
+download_queue = queue.Queue()
 
 # Logging
 logging.basicConfig(
@@ -42,7 +43,7 @@ def detect_platform(url: str) -> str:
     url_lower = url.lower()
     if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
         return 'youtube'
-    elif 'tiktok.com' in url_lower:
+    elif 'tiktok.com' in url_lower or 'vt.tiktok.com' in url_lower:
         return 'tiktok'
     elif 'instagram.com' in url_lower:
         return 'instagram'
@@ -52,120 +53,118 @@ def detect_platform(url: str) -> str:
         return 'facebook'
     elif 'spotify.com' in url_lower:
         return 'spotify'
-    elif 'pinterest.com' in url_lower:
-        return 'pinterest'
     else:
         return 'unknown'
 
 # ========== FUNGSI DOWNLOAD ==========
-async def download_youtube(url: str) -> Optional[Path]:
-    """Download YouTube video (max 480p)"""
-    output = DOWNLOAD_DIR / '%(title)s_%(id)s.%(ext)s'
-    ydl_opts = {
-        'format': 'best[height<=480][filesize<45M]/best[filesize<45M]',
-        'outtmpl': str(output),
-        'quiet': True,
-        'no_warnings': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if Path(filename).exists():
-                return Path(filename)
-        return None
-    except Exception as e:
-        logger.error(f"YouTube error: {e}")
-        return None
-
-async def download_tiktok(url: str) -> Optional[Path]:
-    """Download TikTok video (no watermark)"""
-    output = DOWNLOAD_DIR / '%(title)s_%(id)s.%(ext)s'
-    ydl_opts = {
-        'format': 'best',
-        'outtmpl': str(output),
-        'quiet': True,
-        'no_warnings': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if Path(filename).exists():
-                return Path(filename)
-        return None
-    except Exception as e:
-        logger.error(f"TikTok error: {e}")
-        return None
-
-async def download_instagram(url: str) -> Optional[Path]:
-    """Download Instagram video/reel"""
-    output = DOWNLOAD_DIR / '%(title)s_%(id)s.%(ext)s'
-    ydl_opts = {
-        'format': 'best',
-        'outtmpl': str(output),
-        'quiet': True,
-        'no_warnings': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if Path(filename).exists():
-                return Path(filename)
-        return None
-    except Exception as e:
-        logger.error(f"Instagram error: {e}")
-        return None
-
-async def download_spotify(track_url: str) -> Optional[Path]:
-    """Download Spotify track using spotdl"""
-    output = DOWNLOAD_DIR / '{artist} - {title}.mp3'
-    try:
-        cmd = [
-            'spotdl', track_url,
-            '--output', str(output),
-            '--format', 'mp3'
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
-        
-        # Cari file mp3 yang terdownload
-        for file in DOWNLOAD_DIR.glob('*.mp3'):
-            if file.stat().st_size > 0:
-                return file
-        return None
-    except Exception as e:
-        logger.error(f"Spotify error: {e}")
-        return None
-
-async def download_general(url: str) -> Optional[Path]:
-    """Download from other platforms"""
-    output = DOWNLOAD_DIR / '%(title)s_%(id)s.%(ext)s'
+def download_video_sync(url: str, platform: str) -> Optional[Path]:
+    """Download video secara synchronous (untuk dijalankan di thread)"""
+    output_template = str(DOWNLOAD_DIR / f"%(title)s_%(id)s.%(ext)s")
+    
     ydl_opts = {
         'format': 'best[filesize<45M]',
-        'outtmpl': str(output),
+        'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
+        'ignoreerrors': True,
     }
+    
+    # Khusus YouTube batasi 480p
+    if platform == 'youtube':
+        ydl_opts['format'] = 'best[height<=480][filesize<45M]/best[filesize<45M]'
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if Path(filename).exists():
-                return Path(filename)
+            if info:
+                filename = ydl.prepare_filename(info)
+                # Cek file exist
+                if Path(filename).exists():
+                    return Path(filename)
+                
+                # Coba cari file dengan ekstensi berbeda
+                for ext in ['.mp4', '.webm', '.mkv']:
+                    test_path = Path(str(filename).rsplit('.', 1)[0] + ext)
+                    if test_path.exists():
+                        return test_path
         return None
     except Exception as e:
-        logger.error(f"General error: {e}")
+        logger.error(f"Download error {platform}: {e}")
         return None
+
+def download_worker():
+    """Worker thread untuk memproses download"""
+    while True:
+        try:
+            # Ambil task dari queue
+            task = download_queue.get(timeout=1)
+            if task is None:
+                break
+            
+            chat_id = task['chat_id']
+            url = task['url']
+            platform = task['platform']
+            status_msg_id = task['status_msg_id']
+            context = task['context']
+            
+            # Lakukan download
+            file_path = download_video_sync(url, platform)
+            
+            # Kirim hasil
+            if file_path and file_path.exists():
+                # Kirim video
+                try:
+                    with open(file_path, 'rb') as video:
+                        context.bot.send_video(
+                            chat_id=chat_id,
+                            video=video,
+                            caption=f"✅ *Download Berhasil!*\n"
+                                   f"📌 Platform: {platform.upper()}\n"
+                                   f"📦 Ukuran: {file_path.stat().st_size / (1024*1024):.1f} MB\n"
+                                   f"🤖 @{context.bot.get_me().username}",
+                            parse_mode='Markdown',
+                            timeout=60
+                        )
+                    
+                    # Hapus status message
+                    context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+                    
+                except Exception as e:
+                    logger.error(f"Send video error: {e}")
+                    context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ Gagal mengirim video: {str(e)[:100]}",
+                        parse_mode='Markdown'
+                    )
+                
+                # Hapus file
+                try:
+                    file_path.unlink()
+                except:
+                    pass
+            else:
+                # Gagal download
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    text=f"❌ *Gagal Download!*\n\n"
+                         f"Platform: {platform.upper()}\n"
+                         f"Penyebab:\n"
+                         f"• Video terlalu besar (>45MB)\n"
+                         f"• Link private/expired\n"
+                         f"• Server sedang sibuk\n\n"
+                         f"Coba link lain ya!",
+                    parse_mode='Markdown'
+                )
+                
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
 
 # ========== HANDLER ==========
 def start(update: Update, context: CallbackContext):
-    """Handler /start - Menu utama KECE"""
+    """Handler /start - Menu utama"""
     keyboard = [
         [InlineKeyboardButton("📥 CARA DOWNLOAD", callback_data='help')],
         [InlineKeyboardButton("🎵 SPOTIFY", callback_data='spotify'),
@@ -174,7 +173,7 @@ def start(update: Update, context: CallbackContext):
          InlineKeyboardButton("🎵 TIKTOK", callback_data='tiktok')],
         [InlineKeyboardButton("🐦 TWITTER", callback_data='twitter'),
          InlineKeyboardButton("👥 FACEBOOK", callback_data='facebook')],
-        [InlineKeyboardButton("⭐ SUPPORT", callback_data='donasi'),
+        [InlineKeyboardButton("⭐ DONASI", callback_data='donasi'),
          InlineKeyboardButton("👤 OWNER", url=f"tg://user?id={OWNER_ID}")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -182,15 +181,12 @@ def start(update: Update, context: CallbackContext):
     update.message.reply_text(
         f"✨ *HIRAKO BOT* ✨\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 *Premium Downloader All Sosmed*\n\n"
+        f"🤖 *All-in-One Downloader*\n\n"
         f"Halo *{update.effective_user.first_name}*!\n\n"
-        f"✅ *Supported Platform:*\n"
+        f"✅ *Support:*\n"
         f"▶️ YouTube | 🎵 TikTok | 📸 Instagram\n"
-        f"🐦 Twitter | 👥 Facebook | 🎵 Spotify\n"
-        f"📌 Pinterest | Dan lainnya\n\n"
-        f"📤 *Cara Pakai:*\n"
-        f"Kirimkan link video/musik, saya akan download!\n\n"
-        f"_⚡ Fast | 🎯 Mudah | 🔒 Aman_",
+        f"🐦 Twitter | 👥 Facebook | 🎵 Spotify\n\n"
+        f"📤 *Kirim link*, saya download!",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
@@ -198,30 +194,23 @@ def start(update: Update, context: CallbackContext):
 def help_command(update: Update, context: CallbackContext):
     update.message.reply_text(
         f"📖 *PANDUAN HIRAKO BOT*\n\n"
-        f"1️⃣ *Copy link* dari aplikasi:\n"
-        f"   • YouTube: Share → Copy link\n"
-        f"   • TikTok: Share → Copy link\n"
-        f"   • Spotify: Share → Copy link\n\n"
-        f"2️⃣ *Paste link* di chat ini\n\n"
-        f"3️⃣ *Tunggu* 5-15 detik\n\n"
-        f"4️⃣ *Video/Musik* akan terkirim!\n\n"
+        f"1️⃣ *Copy link* dari aplikasi\n"
+        f"2️⃣ *Paste link* di chat ini\n"
+        f"3️⃣ *Tunggu* 5-15 detik\n"
+        f"4️⃣ *Video terkirim* otomatis!\n\n"
         f"⚠️ *BATASAN:*\n"
-        f"• File max 45MB (kebijakan Telegram)\n"
-        f"• YouTube dibatasi 480p\n"
-        f"• Spotify butuh waktu lebih lama\n\n"
-        f"💡 *Tips:* Gunakan link *public* ya!",
+        f"• File max 45MB\n"
+        f"• YouTube 480p\n\n"
+        f"💡 Link harus *public*!",
         parse_mode='Markdown'
     )
 
 def donasi_command(update: Update, context: CallbackContext):
     update.message.reply_text(
         f"❤️ *DUKUNG HIRAKO BOT* ❤️\n\n"
-        f"Bot ini *GRATIS* selamanya!\n"
-        f"Tapi kalau mau donasi:\n\n"
-        f"💰 *Saweria:* [klik disini](https://saweria.co/hirako)\n"
-        f"💎 *Dana:* 08123456789\n\n"
-        f"Makasih banyak yang sudah pakai Hirako Bot! 🙏\n"
-        f"_Donasi membuat bot ini tetap hidup_",
+        f"Bot ini *GRATIS*!\n\n"
+        f"💰 *Saweria:* [saweria.co/hirako](https://saweria.co/hirako)\n\n"
+        f"Terima kasih! 🙏",
         parse_mode='Markdown',
         disable_web_page_preview=True
     )
@@ -235,65 +224,37 @@ def handle_url(update: Update, context: CallbackContext):
         update.message.reply_text(
             f"❌ *Link tidak dikenali*\n\n"
             f"Kirim link dari:\n"
-            f"✓ YouTube\n✓ TikTok\n✓ Instagram\n"
-            f"✓ Twitter\n✓ Facebook\n✓ Spotify\n\n"
-            f"Atau ketik /help untuk bantuan",
+            f"YouTube | TikTok | Instagram | Twitter | Facebook | Spotify",
             parse_mode='Markdown'
         )
         return
     
-    # Emoji dan pesan platform
-    platform_names = {
-        'youtube': ('YouTube', '▶️'),
-        'tiktok': ('TikTok', '🎵'),
-        'instagram': ('Instagram', '📸'),
-        'twitter': ('Twitter', '🐦'),
-        'facebook': ('Facebook', '👥'),
-        'spotify': ('Spotify', '🎵'),
-        'pinterest': ('Pinterest', '📌'),
+    # Emoji platform
+    emoji_map = {
+        'youtube': '▶️', 'tiktok': '🎵', 'instagram': '📸',
+        'twitter': '🐦', 'facebook': '👥', 'spotify': '🎵'
     }
-    name, emoji = platform_names.get(platform, (platform.upper(), '📹'))
+    emoji = emoji_map.get(platform, '📹')
     
-    # Notifikasi
+    # Kirim pesan status
     status_msg = update.message.reply_text(
-        f"{emoji} *Mendownload dari {name}...*\n"
-        f"⏳ Mohon tunggu, sedang diproses...\n\n"
-        f"_File akan terkirim otomatis_",
+        f"{emoji} *Mendownload dari {platform.upper()}...*\n"
+        f"⏳ Mohon tunggu sebentar...\n\n"
+        f"_Proses download bisa 10-30 detik_",
         parse_mode='Markdown'
     )
     
-    # Pilih fungsi download berdasarkan platform
-    download_funcs = {
-        'youtube': download_youtube,
-        'tiktok': download_tiktok,
-        'instagram': download_instagram,
-        'spotify': download_spotify,
+    # Masukkan ke queue untuk diproses worker
+    task = {
+        'chat_id': update.effective_chat.id,
+        'url': url,
+        'platform': platform,
+        'status_msg_id': status_msg.message_id,
+        'context': context
     }
+    download_queue.put(task)
     
-    # Jalankan download async
-    import threading
-    def download_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        if platform in download_funcs:
-            file_path = loop.run_until_complete(download_funcs[platform](url))
-        else:
-            file_path = loop.run_until_complete(download_general(url))
-        
-        # Kirim hasil ke main thread
-        context.bot.send_message(chat_id=update.effective_chat.id, 
-                                text=f"PROCESS_DONE:{file_path}" if file_path else "PROCESS_FAILED")
-    
-    threading.Thread(target=download_thread, daemon=True).start()
-    
-    # Simpan status message untuk update nanti
-    context.user_data['status_msg_id'] = status_msg.message_id
-
-def check_download_status(update: Update, context: CallbackContext):
-    """Cek status download (callback untuk thread)"""
-    # Ini akan dipanggil dari thread, perlu implementasi queue
-    pass
+    logger.info(f"Task added to queue: {platform} - {url[:50]}")
 
 def button_callback(update: Update, context: CallbackContext):
     """Handler untuk button inline"""
@@ -301,49 +262,47 @@ def button_callback(update: Update, context: CallbackContext):
     query.answer()
     
     if query.data == 'help':
-        query.message.reply_text(
-            f"📖 *CARA CEPAT PAKAI HIRAKO BOT*\n\n"
-            f"1. Buka YouTube/TikTok/Instagram/Spotify\n"
-            f"2. Klik tombol Share → Copy Link\n"
-            f"3. Paste link di chat bot ini\n"
-            f"4. Tunggu sebentar, file akan terkirim!\n\n"
-            f"🎯 *Gampang banget kan?*",
+        query.edit_message_text(
+            f"📖 *CARA PAKAI HIRAKO BOT*\n\n"
+            f"1. Buka YouTube/TikTok/IG\n"
+            f"2. Share → Copy Link\n"
+            f"3. Paste link di chat bot\n"
+            f"4. Tunggu video masuk!\n\n"
+            f"🎯 *Mudah kan?*",
             parse_mode='Markdown'
         )
     elif query.data == 'spotify':
-        query.message.reply_text(
-            f"🎵 *CARA DOWNLOAD SPOTIFY*\n\n"
+        query.edit_message_text(
+            f"🎵 *DOWNLOAD SPOTIFY*\n\n"
             f"1. Buka lagu di Spotify\n"
-            f"2. Klik ⋮ (3 titik) → Share → Copy Link\n"
+            f"2. Share → Copy Link\n"
             f"3. Paste link di chat\n"
-            f"4. Tunggu proses convert ke MP3\n\n"
-            f"⚠️ Butuh waktu 10-30 detik",
-            parse_mode='Markdown'
-        )
-    elif query.data in ['youtube', 'tiktok', 'instagram', 'twitter', 'facebook']:
-        query.message.reply_text(
-            f"✅ *{query.data.upper()} READY*\n\n"
-            f"Kirimkan link video {query.data.upper()} langsung ke chat ini!\n"
-            f"Saya akan download otomatis.",
+            f"4. Tunggu convert ke MP3\n\n"
+            f"⏱️ Butuh 10-30 detik",
             parse_mode='Markdown'
         )
     elif query.data == 'donasi':
-        query.message.reply_text(
+        query.edit_message_text(
             f"❤️ *SUPPORT HIRAKO BOT* ❤️\n\n"
-            f"🤖 Bot: @{context.bot.username}\n"
-            f"👤 Owner: Hirako\n\n"
-            f"Kirim donasi ke:\n"
             f"💰 Saweria: [saweria.co/hirako](https://saweria.co/hirako)\n\n"
-            f"Terima kasih telah menggunakan Hirako Bot! 🙏",
+            f"Terima kasih! 🙏",
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
-    
-    query.message.delete()
+    elif query.data in ['youtube', 'tiktok', 'instagram', 'twitter', 'facebook']:
+        query.edit_message_text(
+            f"✅ *{query.data.upper()} READY*\n\n"
+            f"Kirim link video {query.data.upper()} langsung ke chat!",
+            parse_mode='Markdown'
+        )
 
 def error_handler(update: Update, context: CallbackContext):
     """Handler error global"""
     logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_message:
+        update.effective_message.reply_text(
+            "⚠️ Terjadi kesalahan, coba lagi ya!"
+        )
 
 # ========== MAIN ==========
 def main():
@@ -351,7 +310,11 @@ def main():
     # Buat folder download
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     
-    # Buat updater
+    # Start worker thread untuk download
+    worker_thread = threading.Thread(target=download_worker, daemon=True)
+    worker_thread.start()
+    
+    # Buat updater dengan version python-telegram-bot 13.x
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
     
@@ -372,6 +335,7 @@ def main():
     # Start bot
     logger.info("🚀 HIRAKO BOT STARTED! 🚀")
     logger.info(f"Bot: @{updater.bot.get_me().username}")
+    logger.info(f"Download dir: {DOWNLOAD_DIR}")
     
     # Start polling
     updater.start_polling()
